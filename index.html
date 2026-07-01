@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>The One Who Didn't Come Back</title>
+  <style>
+    /* ---------- Page reset: fullscreen black canvas ---------- */
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+    }
+    #scene-canvas { display: block; width: 100%; height: 100%; }
+
+    /* ---------- Vignette overlay (faint darker edges) ---------- */
+    /* Pure CSS radial gradient on top of the canvas. Cheap, no post-processing.
+       Adjust the last rgba alpha (0.7) to make edges darker/lighter. */
+    #vignette {
+      position: fixed;
+      inset: 0;
+      pointer-events: none; /* let mouse pass through to OrbitControls */
+      background: radial-gradient(ellipse at center,
+                  rgba(0,0,0,0) 45%,
+                  rgba(0,0,0,0.45) 80%,
+                  rgba(0,0,0,0.85) 100%);
+    }
+
+    /* ---------- Loading / error message ---------- */
+    #status {
+      position: fixed;
+      bottom: 14px;
+      left: 16px;
+      font-family: -apple-system, Helvetica, Arial, sans-serif;
+      font-size: 12px;
+      letter-spacing: 0.5px;
+      color: rgba(255, 200, 150, 0.55);
+      pointer-events: none;
+      transition: opacity 1.2s ease;
+    }
+
+    /* ---------- On-screen touch controls (play/pause + restart) ---------- */
+    /* Works on phones (no keyboard) and desktop alike. Kept faint to preserve
+       the cinematic mood; brightens on hover/press. */
+    #controls {
+      position: fixed;
+      left: 50%;
+      bottom: 22px;
+      transform: translateX(-50%);
+      display: flex;
+      gap: 14px;
+      z-index: 10;
+    }
+    #controls button {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 54px;            /* large enough for a comfortable finger tap */
+      height: 54px;
+      border-radius: 50%;
+      border: 1px solid rgba(255, 210, 170, 0.30);
+      background: rgba(20, 16, 12, 0.45);
+      color: rgba(255, 225, 200, 0.85);
+      font-size: 22px;
+      line-height: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      opacity: 0.65;
+      -webkit-backdrop-filter: blur(4px);
+      backdrop-filter: blur(4px);
+      touch-action: manipulation; /* no double-tap zoom delay on mobile */
+      transition: opacity 0.25s ease, background 0.15s ease;
+    }
+    #controls button:hover { opacity: 1; }
+    #controls button:active { opacity: 1; background: rgba(70, 50, 32, 0.8); }
+  </style>
+</head>
+<body>
+  <canvas id="scene-canvas"></canvas>
+  <div id="vignette"></div>
+  <div id="status">Loading…</div>
+
+  <!-- Touch-friendly controls (phones have no keyboard for SPACE/R) -->
+  <div id="controls">
+    <button id="btnPlay" aria-label="Play / Pause" title="Play / Pause">⏸</button>
+    <button id="btnRestart" aria-label="Restart" title="Restart">↻</button>
+  </div>
+
+  <!-- Three.js + loaders from CDN via import map (ES modules) -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // =====================================================================
+    //  TWEAK THESE — the main "knobs" for mood
+    // =====================================================================
+    const CONFIG = {
+      // --- Lamp light (the main, warm light source) ---
+      lampColor:      0xffaa55,  // warm tungsten color
+      lampIntensity:  32,        // brightness of the pooled light
+      lampDistance:   13,        // how far the light reaches — larger = wider pool
+      lampDecay:      1.6,       // falloff (lower = softer, broader spread over the desk)
+      // Where the light/bulb sits INSIDE the lamp shade, as a fraction of the
+      // lamp's height (0 = base, 1 = top). The light position is computed from
+      // the loaded lamp's real bounding box — no more guessing absolute Y.
+      lampBulbHeightFrac: 0.72,
+      // Makes the lamp's shade glow warmly so it reads as "switched on" instead
+      // of a black silhouette. Values >1 push it past "lit" into a real glow
+      // (HDR emissive + tone mapping). ~0.8 = dimly lit, ~1.8 = clearly glowing.
+      lampGlowIntensity: 1.8,
+
+      // --- Ambient (near-zero so the room is very dark) ---
+      ambientColor:     0x223044, // cool, faint blue moonlight tint
+      ambientIntensity: 0.06,     // almost nothing — raise slightly if too dark
+
+      // --- Morning (window) light: cold blue directional dawn ---
+      morningColor:        0xb0bcc9, // cool dawn, less saturated blue (keeps cup more neutral)
+      morningMaxIntensity: 5.5,      // brightness when fully risen (K6) — lights the whole room
+      // Direction the dawn light streams FROM (a low sun outside the window).
+      // The room's "window side" is screen-left (negative X).
+      morningFrom:         { x: -6, y: 5, z: 2.5 },
+
+      // --- Steam (rising from the hot coffee, only early on) ---
+      steamCount:   45,      // wisps of steam
+      steamRise:    0.12,    // how fast steam drifts up (m/s)
+      steamHeight:  0.13,    // how high a wisp rises before recycling (small = stays over cup)
+      steamRadius:  0.018,   // how tightly wisps hug the cup rim (small = confined)
+      steamSize:    0.011,   // size of each puff (much smaller now)
+      steamOpacity: 0.05,    // max faintness of the steam (much fainter now)
+
+      // =================================================================
+      //  CAMERA + LIGHT KEYFRAMES — the whole 82s film, one flowing shot
+      // =================================================================
+      // Each keyframe has a TIME (seconds), a camera POS and a LOOK target,
+      // and the lighting state at that moment. Between keyframes EVERYTHING
+      // is interpolated smoothly (Catmull-Rom curve for the camera path so it
+      // never kinks; eased lerp for every light value), so the viewer feels
+      // one continuous shot through a single night, not 6 separate scenes.
+      //
+      // Tips for adjusting:
+      //   • time     : when this beat happens (seconds). Keep them increasing.
+      //   • pos      : camera world position. +x right, +y up, +z toward front.
+      //   • look     : the point the camera aims at (becomes OrbitControls target).
+      //   • lampInt  : warm lamp brightness.   lampCol : warm lamp color (hex).
+      //   • ambCol/ambInt : faint fill light color/intensity (the "darkness").
+      //   • steam    : 0..1 amount of coffee steam (fades between keyframes).
+      //   • morning  : 0..1 strength of the cold dawn window light (fades in).
+      // Desk top sits at world y≈0.75; the cup is near (-0.05, 0.80, 0.18).
+      totalDuration: 82,   // whole film length (seconds)
+      // true  = camera eases (gently settles) approaching each keyframe — calm,
+      //         contemplative, a faint "pause" at each beat.
+      // false = constant-speed glide through the interior beats (eases only at
+      //         the very start & end) — the most "one continuous flow" feel.
+      easeAtEachKeyframe: false,
+      keyframes: [
+        // K1 — 深夜，有人刚走: wide corner view, slightly low. Full warm lamp, steam rising.
+        { time: 0,  pos: { x: 3.0,  y: 1.50, z: 3.2 },  look: { x: 0.00,  y: 0.85, z: 0.00 },
+          lampInt: 32, lampCol: 0xffaa55, ambCol: 0x223044, ambInt: 0.06, steam: 1, morning: 0 },
+
+        // K2 — 凝视留下的痕迹: glide forward, skimming low across the desktop. Still full warm.
+        { time: 13, pos: { x: 1.0,  y: 0.95, z: 1.6 },  look: { x: -0.10, y: 0.80, z: 0.05 },
+          lampInt: 32, lampCol: 0xffaa55, ambCol: 0x223044, ambInt: 0.06, steam: 1, morning: 0 },
+
+        // K3 — 咖啡凉了: close-up of the cup, begins arcing around it. Lamp dims one notch & cools. Steam gone.
+        { time: 26, pos: { x: 0.35, y: 0.98, z: 0.85 }, look: { x: -0.05, y: 0.80, z: 0.18 },
+          lampInt: 22, lampCol: 0xffb877, ambCol: 0x1e2a40, ambInt: 0.05, steam: 0, morning: 0 },
+
+        // K4 — 夜最深: arcs to the side of the desk, rises a little. Dim & moody — but the
+        // lamp still clearly lights the desk & cup (deep night, NOT pitch black).
+        { time: 40, pos: { x: -1.30, y: 1.25, z: 0.70 }, look: { x: -0.20, y: 0.78, z: 0.10 },
+          lampInt: 20, lampCol: 0xffc999, ambCol: 0x1b2740, ambInt: 0.09, steam: 0, morning: 0 },
+
+        // K5 — 天快亮，等待落空: camera holds the desk/lamp/cup in frame from the window side
+        // (dawn rakes in from the left); cold blue morning overlaps the still-warm lamp.
+        { time: 54, pos: { x: -2.05, y: 1.55, z: 1.50 }, look: { x: -0.15, y: 0.80, z: 0.05 },
+          lampInt: 7,  lampCol: 0xffd9b3, ambCol: 0x35496e, ambInt: 0.70, steam: 0, morning: 0.5 },
+
+        // K6 — 人没回来: slowly pulls way back to a static wide shot. Cold morning light fills
+        // the whole room (table, chair, cup clearly visible); lamp is off. Nothing moved.
+        { time: 82, pos: { x: 2.6,  y: 1.70, z: 3.3 },  look: { x: 0.00,  y: 0.55, z: 0.00 },
+          lampInt: 0,  lampCol: 0xffe0c0, ambCol: 0x9ba7b3, ambInt: 2.0, steam: 0, morning: 1.0 },
+      ],
+
+      // --- Dust particles ---
+      dustCount:      140,        // number of floating motes (halved — faint, not snowy)
+      dustSpread:     3.0,        // cubic area (meters) the dust drifts within
+      dustSize:       0.014,      // size of each mote
+      dustOpacity:    0.22,       // faintness of the motes (lower = dimmer)
+      dustDriftSpeed: 0.04,       // how fast dust drifts (small = slow & calm)
+
+      // --- Per-model placement ---
+      // Each model is auto-scaled so its LARGEST dimension equals `maxSize`
+      // (meters), regardless of the file's native units. This fixes the
+      // "chair is huge / table is small" mismatch.
+      //   maxSize   : real-world size of the biggest dimension (m)
+      //   on        : 'floor' = grounded on the floor; 'table' = sits on the desktop
+      //   offset    : x/z position relative to the desk center (m)
+      //   rotY      : rotation around vertical axis (radians)
+      // x/z meaning: +x = right, +z = toward the camera/front of the desk.
+      models: {
+        table: { file: 'models/table.glb', maxSize: 1.5,  on: 'floor', offset: { x: 0,    z: 0    }, rotY: 0 },
+        chair: { file: 'models/chair.glb', maxSize: 1.0,  on: 'floor', offset: { x: -0.75, z: 0.9 }, rotY: THREE.MathUtils.degToRad(40) }, // shoved to the left & angled ~40°, vacated
+        lamp:  { file: 'models/lamp.glb',  maxSize: 0.5,  on: 'table', offset: { x: -0.35, z: -0.2 }, rotY: 0 }, // back-left of desk
+        cup:   { file: 'models/cup.glb',   maxSize: 0.11, on: 'table', offset: { x: -0.05, z: 0.18 }, rotY: 0 }, // focal point: under the lamp, pulled forward so the camera sees the coffee inside
+      },
+
+      // Set true to print each model's measured size to the console (handy for
+      // dialing in maxSize / offsets). Turn off once placement looks right.
+      debug: true,
+    };
+    // =====================================================================
+
+    const statusEl = document.getElementById('status');
+
+    // ---------- Renderer ----------
+    const canvas = document.getElementById('scene-canvas');
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // cap for laptop perf
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap; // soft shadow edges
+    renderer.toneMapping = THREE.ACESFilmicToneMapping; // cinematic tone curve
+    renderer.toneMappingExposure = 1.0;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+    // ---------- Scene ----------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x05060a); // near-black, faint cool tint
+    // Subtle fog deepens the darkness toward the edges of the room.
+    scene.fog = new THREE.FogExp2(0x05060a, 0.12);
+
+    // ---------- Camera ----------
+    const camera = new THREE.PerspectiveCamera(
+      40, window.innerWidth / window.innerHeight, 0.1, 100
+    );
+    const K0 = CONFIG.keyframes[0]; // start the film on the first keyframe
+    camera.position.set(K0.pos.x, K0.pos.y, K0.pos.z);
+
+    // ---------- Controls (manual exploration when paused) ----------
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.target.set(K0.look.x, K0.look.y, K0.look.z);
+    controls.minDistance = 0.4;
+    controls.maxDistance = 14;
+    controls.maxPolarAngle = Math.PI * 0.52; // keep camera from going under the floor
+
+    // =====================================================================
+    //  LIGHTING
+    // =====================================================================
+    // Very faint ambient so nothing is pure pitch-black (raise intensity if needed).
+    const ambient = new THREE.AmbientLight(CONFIG.ambientColor, CONFIG.ambientIntensity);
+    scene.add(ambient);
+
+    // The lamp's warm PointLight — the star of the scene.
+    const lampLight = new THREE.PointLight(
+      CONFIG.lampColor, CONFIG.lampIntensity, CONFIG.lampDistance, CONFIG.lampDecay
+    );
+    // Provisional position; relocated to the lamp's bulb once lamp.glb loads.
+    lampLight.position.set(0, 1.5, 0);
+    lampLight.castShadow = true;
+    lampLight.shadow.mapSize.set(1024, 1024);
+    lampLight.shadow.bias = -0.0005;        // reduce shadow acne
+    lampLight.shadow.radius = 4;            // softer shadow penumbra
+    lampLight.shadow.camera.near = 0.1;
+    lampLight.shadow.camera.far = CONFIG.lampDistance;
+    scene.add(lampLight);
+
+    // The cold-blue DAWN light from the window. Fades in over K4→K6. Starts at
+    // zero intensity; the keyframe `morning` value (0..1) drives its brightness.
+    const morningLight = new THREE.DirectionalLight(CONFIG.morningColor, 0);
+    morningLight.position.set(CONFIG.morningFrom.x, CONFIG.morningFrom.y, CONFIG.morningFrom.z);
+    morningLight.target.position.set(0, 0.5, 0); // aim across the desk
+    morningLight.castShadow = true;
+    morningLight.shadow.mapSize.set(1024, 1024);
+    morningLight.shadow.bias = -0.0004;
+    morningLight.shadow.radius = 5;
+    // Tight ortho frustum around the desk area = crisper, cheaper dawn shadows.
+    const dcam = morningLight.shadow.camera;
+    dcam.left = -4; dcam.right = 4; dcam.top = 4; dcam.bottom = -4; dcam.near = 0.5; dcam.far = 20;
+    scene.add(morningLight);
+    scene.add(morningLight.target);
+
+    // Tiny glowing sphere at the bulb so the light source reads visually
+    // (emissive material is unaffected by lighting, so it always "glows").
+    const bulb = new THREE.Mesh(
+      new THREE.SphereGeometry(0.05, 16, 16),
+      new THREE.MeshBasicMaterial({ color: CONFIG.lampColor })
+    );
+    bulb.position.copy(lampLight.position);
+    scene.add(bulb);
+
+    // Lamp shade materials, captured at load. Their warm emissive glow is driven
+    // from the keyframes every frame (so it cools & fades off with the lamp).
+    const lampMaterials = [];
+    const LAMP_FULL_INTENSITY = CONFIG.keyframes[0].lampInt; // "full brightness" reference
+
+    // Steam system (built once the cup's real position is known).
+    let steam = null, steamData = null;
+    const steamOrigin = new THREE.Vector3(-0.05, 0.95, 0.18); // overwritten from the cup
+
+    // ---------- Floor (catches shadows, grounds the scene) ----------
+    const floor = new THREE.Mesh(
+      new THREE.PlaneGeometry(40, 40),
+      new THREE.MeshStandardMaterial({ color: 0x161310, roughness: 0.95, metalness: 0 })
+    );
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.y = 0;
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    // =====================================================================
+    //  DUST PARTICLES — faint motes drifting slowly in the lamp light
+    // =====================================================================
+    let dust, dustVelocities;
+    // Center of the drifting dust volume. buildScene() lowers its Y to match
+    // the measured desk height so the motes hang around the lit area.
+    const dustCenter = { x: 0, y: 1.0, z: 0 };
+    function createDust() {
+      const count = CONFIG.dustCount;
+      const positions = new Float32Array(count * 3);
+      dustVelocities = new Float32Array(count * 3);
+
+      // Scatter dust roughly around the lit desk area.
+      const center = dustCenter;
+      for (let i = 0; i < count; i++) {
+        positions[i * 3 + 0] = center.x + (Math.random() - 0.5) * CONFIG.dustSpread;
+        positions[i * 3 + 1] = center.y + (Math.random() - 0.5) * CONFIG.dustSpread;
+        positions[i * 3 + 2] = center.z + (Math.random() - 0.5) * CONFIG.dustSpread;
+        // Small random drift velocity per mote.
+        dustVelocities[i * 3 + 0] = (Math.random() - 0.5) * CONFIG.dustDriftSpeed;
+        dustVelocities[i * 3 + 1] = (Math.random() - 0.5) * CONFIG.dustDriftSpeed * 0.5;
+        dustVelocities[i * 3 + 2] = (Math.random() - 0.5) * CONFIG.dustDriftSpeed;
+      }
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+      const mat = new THREE.PointsMaterial({
+        color: 0xffd9a0,          // warm, matches lamp
+        size: CONFIG.dustSize,
+        transparent: true,
+        opacity: CONFIG.dustOpacity,
+        depthWrite: false,         // don't occlude; looks like floating haze
+        blending: THREE.AdditiveBlending,
+        sizeAttenuation: true,
+      });
+
+      dust = new THREE.Points(geo, mat);
+      scene.add(dust);
+    }
+    createDust();
+
+    function updateDust(dt) {
+      const pos = dust.geometry.attributes.position.array;
+      const half = CONFIG.dustSpread / 2;
+      const center = dustCenter;
+      for (let i = 0; i < CONFIG.dustCount; i++) {
+        pos[i * 3 + 0] += dustVelocities[i * 3 + 0] * dt;
+        pos[i * 3 + 1] += dustVelocities[i * 3 + 1] * dt;
+        pos[i * 3 + 2] += dustVelocities[i * 3 + 2] * dt;
+        // Wrap motes back into the volume so they drift forever.
+        for (let a = 0; a < 3; a++) {
+          const c = a === 0 ? center.x : a === 1 ? center.y : center.z;
+          if (pos[i * 3 + a] > c + half) pos[i * 3 + a] = c - half;
+          if (pos[i * 3 + a] < c - half) pos[i * 3 + a] = c + half;
+        }
+      }
+      dust.geometry.attributes.position.needsUpdate = true;
+    }
+
+    // =====================================================================
+    //  MODEL LOADING
+    // =====================================================================
+    const loader = new GLTFLoader();
+
+    // Where the top of the desk is, in world Y. Measured from table.glb once it
+    // loads, so lamp & cup sit exactly on the surface no matter the model's size.
+    let deskTopY = 1.0; // fallback until the table is measured
+
+    // Load one GLB and return its raw scene (un-positioned). Resolves null on error.
+    function loadRaw(key) {
+      const m = CONFIG.models[key];
+      return new Promise((resolve) => {
+        loader.load(
+          m.file,
+          (gltf) => { console.log(`✓ Loaded "${key}" from ${m.file}`); resolve(gltf.scene); },
+          undefined, // (progress callback omitted)
+          (err) => {
+            // Clear, per-model error message so you know exactly what failed.
+            console.error(`✗ FAILED to load "${key}" from "${m.file}". ` +
+              `Check the file exists in /models and the path is correct.`, err);
+            resolve(null); // keep the scene running even if one model is missing
+          }
+        );
+      });
+    }
+
+    // Enable shadow casting/receiving on every mesh in a model.
+    function enableShadows(obj) {
+      obj.traverse((c) => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+    }
+
+    // Scale a model so its largest dimension == maxSize, then return its
+    // (post-scale) bounding box and size for placement math.
+    function normalize(obj, maxSize) {
+      const box = new THREE.Box3().setFromObject(obj);
+      const size = box.getSize(new THREE.Vector3());
+      const biggest = Math.max(size.x, size.y, size.z) || 1;
+      const s = maxSize / biggest;
+      obj.scale.setScalar(s);
+      // Re-measure after scaling so callers get final world-space numbers.
+      const box2 = new THREE.Box3().setFromObject(obj);
+      return { box: box2, size: box2.getSize(new THREE.Vector3()) };
+    }
+
+    // Place a model: rotate, then position by its offset; ground it either on
+    // the floor (y=0) or on the desktop (y=deskTopY) using its measured box.
+    function place(obj, m, surfaceY) {
+      obj.rotation.y = m.rotY;
+      const box = new THREE.Box3().setFromObject(obj);
+      const center = box.getCenter(new THREE.Vector3());
+      // Center the model on its offset in x/z, and rest its base on the surface.
+      obj.position.x += m.offset.x - center.x;
+      obj.position.z += m.offset.z - center.z;
+      obj.position.y += surfaceY - box.min.y;
+    }
+
+    async function buildScene() {
+      // ---- 1. Table first: it defines the desktop height everything sits on ----
+      const tableObj = await loadRaw('table');
+      if (tableObj) {
+        const mt = CONFIG.models.table;
+        const { box, size } = normalize(tableObj, mt.maxSize);
+        enableShadows(tableObj);
+        place(tableObj, mt, 0); // grounded on the floor
+        scene.add(tableObj);
+        deskTopY = new THREE.Box3().setFromObject(tableObj).max.y; // top surface
+        if (CONFIG.debug) console.log(`📏 table size ≈ ${size.x.toFixed(2)} × ${size.y.toFixed(2)} × ${size.z.toFixed(2)} m, desktop at y=${deskTopY.toFixed(2)}`);
+      }
+
+      // ---- 2. The rest, placed relative to floor or desktop ----
+      let cupCenter = null;
+      for (const key of ['chair', 'lamp', 'cup']) {
+        const obj = await loadRaw(key);
+        if (!obj) continue;
+        const m = CONFIG.models[key];
+        const { size } = normalize(obj, m.maxSize);
+        enableShadows(obj);
+        place(obj, m, m.on === 'table' ? deskTopY : 0);
+        scene.add(obj);
+        if (CONFIG.debug) console.log(`📏 ${key} size ≈ ${size.x.toFixed(2)} × ${size.y.toFixed(2)} × ${size.z.toFixed(2)} m`);
+
+        if (key === 'cup') cupCenter = new THREE.Box3().setFromObject(obj).getCenter(new THREE.Vector3());
+
+        // Put the warm light (and glowing bulb) inside the lamp shade, using the
+        // lamp's real bounding box rather than a hardcoded height.
+        if (key === 'lamp') {
+          const lb = new THREE.Box3().setFromObject(obj);
+          const c = lb.getCenter(new THREE.Vector3());
+          const bulbY = lb.min.y + (lb.max.y - lb.min.y) * CONFIG.lampBulbHeightFrac;
+          lampLight.position.set(c.x, bulbY, c.z);
+          bulb.position.copy(lampLight.position);
+          if (CONFIG.debug) console.log(`💡 lamp light placed at y=${bulbY.toFixed(2)}`);
+
+          // Make the shade glow so the lamp reads as "on" rather than a black
+          // silhouette. We capture its materials and drive their emissive glow
+          // from the keyframes each frame; also stop the lamp shadowing itself.
+          obj.traverse((child) => {
+            if (child.isMesh && child.material) {
+              child.castShadow = false; // shade no longer shadows itself dark
+              const mats = Array.isArray(child.material) ? child.material : [child.material];
+              mats.forEach((mat) => {
+                if ('emissive' in mat) {
+                  if ('emissiveIntensity' in mat) mat.emissiveIntensity = 1.0;
+                  lampMaterials.push(mat); // glow set per-frame in applyTimeline()
+                }
+              });
+            }
+          });
+        }
+      }
+
+      // ---- 3. Anchor the time-based extras now the layout is known ----
+      // Steam rises from just above the real cup rim (falls back to desk center).
+      const focus = cupCenter || new THREE.Vector3(0, deskTopY, 0);
+      steamOrigin.set(focus.x, focus.y + 0.05, focus.z);
+      createSteam();
+
+      // Settle the dust cloud over the lit desk area.
+      dustCenter.y = deskTopY + 0.45;
+
+      // Swap the loading text for a faint, persistent hint (buttons handle the rest).
+      statusEl.innerHTML = 'drag to look around';
+      statusEl.style.opacity = '0.35';
+      console.log('All model load attempts finished. Press SPACE to pause/play, R to restart.');
+    }
+    buildScene();
+
+    // =====================================================================
+    //  STEAM PARTICLES — wisps rising from the hot coffee (early scenes only)
+    // =====================================================================
+    function resetSteamParticle(i, randomLife) {
+      // Each wisp gets a fixed angle/radius around the rim and rises straight up
+      // from there (with a tiny sway), so steam stays a tight column over the cup
+      // instead of drifting off toward the lamp.
+      steamData.life[i]   = randomLife ? Math.random() : 0; // 0..1 progress upward
+      steamData.speed[i]  = 0.6 + Math.random() * 0.8;      // per-wisp speed multiplier
+      steamData.angle[i]  = Math.random() * Math.PI * 2;    // position around the rim
+      steamData.radius[i] = Math.random() * CONFIG.steamRadius;
+    }
+    function createSteam() {
+      const n = CONFIG.steamCount;
+      const positions = new Float32Array(n * 3);
+      steamData = {
+        life: new Float32Array(n), speed: new Float32Array(n),
+        angle: new Float32Array(n), radius: new Float32Array(n),
+      };
+      for (let i = 0; i < n; i++) resetSteamParticle(i, true);
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      const mat = new THREE.PointsMaterial({
+        color: 0xfff4e6, size: CONFIG.steamSize, transparent: true,
+        opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true,
+      });
+      steam = new THREE.Points(geo, mat);
+      scene.add(steam);
+    }
+    function updateSteam(dt, amount) {
+      if (!steam) return;
+      // Make steam clearly GONE before K3: vanish once the keyframe amount drops
+      // below ~0.25 (so it's fully faded a couple seconds before the cup close-up).
+      const amt = Math.max(0, (amount - 0.25) / 0.75);
+      // Wisps also fade individually as they rise (thinner at the top).
+      steam.material.opacity = CONFIG.steamOpacity * amt;
+      if (amt <= 0.001) { steam.visible = false; return; }
+      steam.visible = true;
+      const pos = steam.geometry.attributes.position.array;
+      for (let i = 0; i < CONFIG.steamCount; i++) {
+        steamData.life[i] += (CONFIG.steamRise * steamData.speed[i] / CONFIG.steamHeight) * dt;
+        if (steamData.life[i] >= 1) resetSteamParticle(i, false);
+        const L = steamData.life[i];
+        // Radius widens slightly as it rises; a tiny sway keeps it organic but bounded.
+        const r = steamData.radius[i] * (1 + L * 0.6);
+        const sway = Math.sin(L * 5.0 + i) * 0.004;
+        pos[i * 3 + 0] = steamOrigin.x + Math.cos(steamData.angle[i]) * r + sway;
+        pos[i * 3 + 1] = steamOrigin.y + L * CONFIG.steamHeight;
+        pos[i * 3 + 2] = steamOrigin.z + Math.sin(steamData.angle[i]) * r;
+      }
+      steam.geometry.attributes.position.needsUpdate = true;
+    }
+
+    // =====================================================================
+    //  CAMERA PATH + TIMELINE — the whole film as one continuous shot
+    // =====================================================================
+    const KF = CONFIG.keyframes;
+    // Catmull-Rom curves give a fluid, kink-free path through the waypoints, so
+    // the camera never snaps at a keyframe. ('centripetal' = no overshoot/loops.)
+    const posCurve  = new THREE.CatmullRomCurve3(
+      KF.map(k => new THREE.Vector3(k.pos.x,  k.pos.y,  k.pos.z)),  false, 'centripetal');
+    const lookCurve = new THREE.CatmullRomCurve3(
+      KF.map(k => new THREE.Vector3(k.look.x, k.look.y, k.look.z)), false, 'centripetal');
+
+    // Pre-parse keyframe colors once (avoid re-allocating every frame).
+    KF.forEach(k => { k._lampCol = new THREE.Color(k.lampCol); k._ambCol = new THREE.Color(k.ambCol); });
+
+    // Fog/background tints, blended by the morning amount (night -> cold dawn).
+    const NIGHT_BG = new THREE.Color(0x05060a);
+    const DAWN_BG  = new THREE.Color(0x33455f); // visibly lit cool dawn, not near-black
+
+    // C2-smooth easing — gentle settle approaching each keyframe, no jerk.
+    const smootherstep = (t) => t * t * t * (t * (t * 6 - 15) + 10);
+
+    // Map an elapsed time to { segment index, eased local progress, global u }.
+    function timelineAt(t) {
+      const last = KF.length - 1;
+      if (t <= 0)             return { seg: 0,        local: 0, u: 0 };
+      if (t >= KF[last].time) return { seg: last - 1, local: 1, u: 1 };
+      let seg = 0;
+      while (seg < last && KF[seg + 1].time <= t) seg++;
+      const span  = KF[seg + 1].time - KF[seg].time;
+      const local = span > 0 ? (t - KF[seg].time) / span : 0;
+
+      let eased;
+      if (CONFIG.easeAtEachKeyframe) {
+        eased = smootherstep(local);              // settle at every keyframe
+      } else if (seg === 0) {
+        eased = local * local;                    // ease IN from rest at the very start
+      } else if (seg === last - 1) {
+        eased = 1 - (1 - local) * (1 - local);    // ease OUT to rest at the very end
+      } else {
+        eased = local;                            // constant-speed glide through interior beats
+      }
+      const u = (seg + eased) / last; // 0..1 parameter along both Catmull-Rom curves
+      return { seg, local: eased, u };
+    }
+
+    // Reusable temporaries (no per-frame allocation).
+    const _pos = new THREE.Vector3(), _look = new THREE.Vector3(), _col = new THREE.Color();
+
+    // Apply the full scene state at time t. Returns the current steam amount.
+    // moveCamera=false leaves the camera alone (so OrbitControls works when paused).
+    function applyTimeline(t, moveCamera) {
+      const { seg, local, u } = timelineAt(t);
+      const a = KF[seg], b = KF[seg + 1], f = local;
+
+      // --- Camera glides along the smooth curves ---
+      if (moveCamera) {
+        posCurve.getPoint(u, _pos);
+        lookCurve.getPoint(u, _look);
+        camera.position.copy(_pos);
+        controls.target.copy(_look);
+      }
+
+      // --- Warm lamp: brightness + color ---
+      lampLight.intensity = a.lampInt + (b.lampInt - a.lampInt) * f;
+      lampLight.color.copy(a._lampCol).lerp(b._lampCol, f);
+      bulb.material.color.copy(lampLight.color);
+      bulb.visible = lampLight.intensity > 0.5; // hide source once lamp is off
+      // Glowing shade follows the lamp's color & relative brightness, fading to black.
+      const glowAmt = CONFIG.lampGlowIntensity * (lampLight.intensity / LAMP_FULL_INTENSITY);
+      _col.copy(lampLight.color).multiplyScalar(glowAmt);
+      for (const mat of lampMaterials) mat.emissive.copy(_col);
+
+      // --- Faint ambient fill (the "darkness") ---
+      ambient.intensity = a.ambInt + (b.ambInt - a.ambInt) * f;
+      ambient.color.copy(a._ambCol).lerp(b._ambCol, f);
+
+      // --- Cold blue dawn from the window, fading in over K4->K6 ---
+      const morning = a.morning + (b.morning - a.morning) * f;
+      morningLight.intensity = morning * CONFIG.morningMaxIntensity;
+
+      // --- Fog / background drift from night to dawn ---
+      _col.copy(NIGHT_BG).lerp(DAWN_BG, morning);
+      scene.background.copy(_col);
+      scene.fog.color.copy(_col);
+      // Clearer air at dawn so the wide morning shot isn't washed into the fog.
+      scene.fog.density = 0.12 * (1 - morning * 0.7);
+
+      // --- Steam amount (fades out across K2->K3 from the keyframe values) ---
+      return a.steam + (b.steam - a.steam) * f;
+    }
+
+    // =====================================================================
+    //  ANIMATION LOOP — drives the one continuous shot
+    // =====================================================================
+    const clock = new THREE.Clock();
+    let elapsed = 0;
+    let playing = true; // grabbing the view pauses; on-screen buttons / SPACE toggle
+
+    // Central play/pause + restart so the buttons and keyboard stay in sync.
+    const btnPlay = document.getElementById('btnPlay');
+    const btnRestart = document.getElementById('btnRestart');
+    function syncPlayButton() { btnPlay.textContent = playing ? '⏸' : '▶'; }
+    function setPlaying(v) { playing = v; syncPlayButton(); }
+    function restartFilm() { elapsed = 0; setPlaying(true); }
+
+    // Grabbing the camera pauses playback so you can orbit/inspect freely.
+    controls.addEventListener('start', () => setPlaying(false));
+
+    // On-screen buttons — the only controls that work on a phone (no keyboard).
+    btnPlay.addEventListener('click', () => {
+      // If we're sitting at the very end, the play button replays from the top.
+      if (elapsed >= CONFIG.totalDuration) restartFilm();
+      else setPlaying(!playing);
+    });
+    btnRestart.addEventListener('click', restartFilm);
+
+    // Keyboard shortcuts (desktop convenience).
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'Space') { e.preventDefault(); setPlaying(!playing); } // pause / resume
+      if (e.code === 'KeyR')  { restartFilm(); }                            // restart film
+    });
+    syncPlayButton();
+
+    // Debug/capture helper: jump to a given time (seconds) and pause there.
+    // e.g. in the console: seekFilm(26)  — handy for screenshotting each scene.
+    window.seekFilm = (t) => {
+      elapsed = Math.max(0, Math.min(t, CONFIG.totalDuration));
+      playing = false;
+      applyTimeline(elapsed, true);
+    };
+
+    // Capture helper: seek to time t, render, and POST a PNG of the canvas to a
+    // local receiver (used to save per-scene stills). Dev-only; safe to delete.
+    window.captureFrame = (t, name) => {
+      window.seekFilm(t);
+      camera.lookAt(controls.target);                 // orient before rendering (capture is synchronous)
+      renderer.render(scene, camera);                 // ensure the buffer is fresh
+      const data = renderer.domElement.toDataURL('image/png');
+      return fetch('http://127.0.0.1:8300/' + name, {
+        method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: data,
+      }).then(r => r.ok).catch(e => String(e));
+    };
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const dt = Math.min(clock.getDelta(), 0.05); // clamp big gaps (tab refocus etc.)
+
+      let steamAmt;
+      if (playing) {
+        elapsed = Math.min(elapsed + dt, CONFIG.totalDuration);
+        steamAmt = applyTimeline(elapsed, true);  // camera + lights follow the timeline
+      } else {
+        steamAmt = applyTimeline(elapsed, false); // hold lights; let OrbitControls move
+      }
+
+      updateDust(dt);
+      updateSteam(dt, steamAmt);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // ---------- Resize handling ----------
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
